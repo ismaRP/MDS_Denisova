@@ -2,6 +2,10 @@
 .Rhistory
 .Rapp.history
 
+# Raw data
+data/by_taxa
+data/denisova_mzml
+
 # Session Data files
 .RData
 .RDataTmp

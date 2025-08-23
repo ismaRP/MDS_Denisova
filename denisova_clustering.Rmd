@@ -1,0 +1,546 @@
+---
+title: "Denisova data analysis"
+output: html_notebook
+---
+
+```{r message=FALSE, echo=FALSE, warning=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(Spectra)
+library(MsCoreUtils)
+library(ggpointdensity)
+library(viridis)
+library(fs)
+library(tictoc)
+library(pheatmap)
+library(ggside)
+library(MetaboCoreUtils)
+library(scales)
+library(MALDIzooMS)
+library(dendextend)
+library(khroma)
+```
+
+```{r, message=T}
+mzml_folder = '/home/ismael/palaeoproteomics/MALDI/denisova/data/by_taxa/'
+project_folder = '/home/ismael/palaeoproteomics/MALDI/denisova'
+
+# Read metadata
+denisova_metadata = read_csv(
+  path(project_folder, 'metadata_eastchamber_q2e_triplicated.csv')
+) %>%
+  mutate(layer=factor(layer, levels=sort(unique(layer))),
+         batch=as.factor(batch),
+         plate=as.factor(plate))
+
+pep_markers_agg = read_csv(
+  path(project_folder, 'marker_masses_agg.csv')
+)
+pep_markers_agg = pep_markers_agg %>% arrange(mass)
+
+seq_collagen = read_csv(
+  path(project_folder, 'col_type_I_ref.csv')
+)
+
+ref_contams = read_csv(
+  path(project_folder, 'contaminants_list.csv')
+)
+
+seq_contams = read_csv(
+  path(project_folder, 'contams.csv')
+)
+
+# ext_contam_seqref = ext_ref_peaks(seq_contams, ret.object = 'MassPeaks', non_deam = T)
+ext_collagen_seqref = ext_ref_peaks(seq_collagen, ret.object = 'df', non_deam = T)
+```
+
+```{r, rows.print=10}
+denisova_metadata %>%
+  group_by(batch, plate, layer) %>% summarise(n()) %>%
+  arrange(batch, plate, layer)
+
+denisova_metadata %>%
+  group_by(batch) %>% summarise(n())
+
+denisova_metadata %>%
+  filter(layer == 11.3) %>%
+  group_by(batch, zooMS_ID) %>% summarise(n())
+
+## Layers 12 and 15
+# Batch 15, plate 3 -> layers 12 and 15
+# Batch 16, plates 3,4,7,8,9,11 -> layers 12 and 15
+
+## Layers 12 and 14
+# Batch 16, plates 4 -> layers 12 and 14
+# Batch 18, plate 1 (2?) -> layers 12 and 14
+
+# Batch 16, plates 3, 4, 5, 6 -> layers 12 and 14
+# Batch 18, plates 1 and 2 -> layers 12 and 14
+
+## Layers 13, 14, 15
+# Batch 17, all plates 
+# Batch 17, plate 5, layers 14, 15
+# Batch 17, plate 7, layers 13, 14
+
+## Others
+# Batch 16 all by itself, layer 9.3, 11.3, 11.4, 12, 14, 15
+# Batch 16 plate 4 -> layers 12 14
+# Batch 16 plate 10 -> layers 9.3, 11.2, 11.4
+
+# Batch 20 all plates
+# Batch 20 plate 2 -> layer 9.2, 11.2
+# Batch 20 plate 8 -> layer 14.0, 17.1
+```
+
+```{r}
+# Taxa groups
+zooms_groups = c(
+  'Bos/Bison',
+  'Cervidae/Gazella/Saiga',
+  'Ovis',
+  'Equidae',
+  'Rhinocerotidae',
+  'Capra',
+  'Crocuta/Panthera',
+  'Canidae',
+  'Ursidae'
+)
+
+denisova_metadata = denisova_metadata %>%
+  filter(zooMS_ID %in% zooms_groups)
+
+denisova_metadata$spectra_name = paste0(
+    denisova_metadata$sample_name, '_', denisova_metadata$replicate)
+
+```
+
+## Read files into Spectra
+
+```{r}
+mzml_files = dir_ls(mzml_folder)
+ncores = 6
+sps_mzr = suppressMessages(
+  Spectra(mzml_files, source = MsBackendMzR(), centroided = FALSE,
+          BPPARAM = MulticoreParam(workers = ncores)))
+
+
+processingChunkSize(sps_mzr) = 40
+
+nrow(denisova_metadata)
+length(sps_mzr)
+
+# Make metadata and Spectra object match
+idx = match(sps_mzr$spectrumId, denisova_metadata$spectra_name)
+denisova_metadata = denisova_metadata[idx,]
+all(denisova_metadata$spectra_name == sps_mzr$spectrumId)
+sps_mzr$sample_name = denisova_metadata$sample_name
+
+
+# Test
+# test_idx = which(denisova_metadata$plate %in% c('10', '11'))
+# denisova_metadata = denisova_metadata[test_idx,]
+# denisova_metadata = droplevels(denisova_metadata)
+# sps_mzr = sps_mzr[test_idx]
+# all(denisova_metadata$spectra_name == sps_mzr$spectrumId)
+
+```
+
+## Preprocessing to peak lists
+
+### Quality Control
+```{r}
+sps_mzr = atipicalitySpectra(
+  sps_mzr,
+  labels = denisova_metadata$plate,
+  BPPARAM=MulticoreParam(workers=ncores, progressbar = TRUE))
+
+```
+
+
+```{r}
+qc_fail = which(sps_mzr$QCflag=='QCfail')
+```
+
+
+
+```{r}
+transform_sqrt = function(x, ...) {
+  x[,2] = sqrt(x[,2])
+  return(x)
+}
+sps_mzr_sqrt = addProcessing(sps_mzr, transform_sqrt)
+
+
+smooth_sg_hws = 8L
+sps_mzr_smooth = MALDIzooMS::smoothSpectra(
+  sps_mzr_sqrt, method = 'SavitzkyGolay',
+  hws = smooth_sg_hws, k=3L, int_index = 'intensity', in_place = TRUE,
+  halfWindowSize = smooth_sg_hws
+)
+
+iterations = 50
+sps_mzr_bl = MALDIzooMS::baselineCorrection(
+  sps_mzr_smooth, int_index = 'intensity', keep_bl = FALSE,
+  substract_index = 'intensity', in_place = TRUE,
+  method = 'SNIP', iterations = iterations, decreasing = TRUE)
+
+sps_mzr_norm = normalizeSpectra(sps_mzr_bl, scale_f=sum)
+
+# PEAKS
+local_max_hws = 15L
+snr = 3
+k = 10L
+threshold = 0.33
+tictoc::tic('Processing spectra into peaks')
+sps_peaks = peakDetection(
+  sps_mzr_norm, apply_queue=TRUE, halfWindowSize = local_max_hws,
+  method = 'SuperSmoother', snr = 3, k = k, threshold = threshold,
+  descending = TRUE, int_index = 'intensity', add_snr=TRUE,
+  in_memory=TRUE, write_data=FALSE,
+  BPPARAM = MulticoreParam(workers = ncores, progressbar = TRUE),
+  verbose=TRUE)
+
+# Change centroided to TRUE now that we are picking peaks
+centroided(sps_peaks_norm) = TRUE
+tictoc::toc()
+
+```
+
+
+### Checkpoint
+```{r, eval=FALSE}
+export(object=sps_peaks, backend=MsBackendMzR(), format='mzML',
+       file=path(project_folder, 'data/processed_peaks.mzML'))
+```
+
+```{r, eval=FALSE}
+sps_peaks = suppressMessages(
+  Spectra(path(project_folder, 'data/processed_peaks.mzML'),
+          source = MsBackendMzR(), centroided = TRUE,
+          BPPARAM = MulticoreParam(workers = ncores)))
+
+all(denisova_metadata$spectra_name == sps_peaks$spectrumId)
+sps_peaks$sample_name = denisova_metadata$sample_name
+
+```
+
+### Deisotoping
+```{r, eval=TRUE}
+min_cor = 0.1
+ppm = 100
+sps_monoiso_peaks = monoisotopic_peaks(
+    sps_peaks, ppm=ppm, minCor=min_cor, distance=1.00235, size=3L:6L)
+
+
+# Add QC variables
+sps_monoiso_peaks$Atipicality = sps_mzr$Atipicality
+sps_monoiso_peaks$QCflag = sps_mzr$QCflag
+sps_monoiso_peaks$QCmin = sps_mzr$QCmin
+sps_monoiso_peaks$QCmax = sps_mzr$QCmax
+
+
+```
+
+
+## Peak alignment into a matrix
+
+
+### Warping/Aligning
+
+```{r}
+low_peaks = which(sps_monoiso_peaks$peaksCount < 5)
+qc_fail = which(sps_monoiso_peaks$QCflag == 'QCfail')
+to_remove = unique(c(qc_fail, low_peaks))
+```
+
+We are going to remove the spectra flagged by the quality control Atipicality measure 
+and spectra with less than 5 peaks.
+
+```{r}
+sps_filtered_spectra = sps_monoiso_peaks[-to_remove]
+denisova_metadata_filtered = denisova_metadata[-to_remove,]
+```
+
+```{r}
+int_ref = int_ref_peaks(
+  sps_filtered_spectra, minFreq = 0.2, method = "strict", tolerance = 5e-4,
+  labels = denisova_metadata_filtered$zooMS_ID,
+  ret.object='MassPeaks')
+
+sps_aligned = align_peaks(
+  sps_filtered_spectra, tolerance = 5e-4, reference=int_ref,
+  allowNoMatches=T, emptyNoMatches=F, return_ref=F)
+
+```
+
+
+### Binning
+```{r}
+sps_binned = bin_peaks(
+  sps_aligned, method='strict', tolerance=4e-4)
+sps_binned = bin_peaks(
+  sps_binned, method='relaxed', tolerance=1e-4)
+```
+
+
+### Merge replicates
+```{r}
+all(denisova_metadata_filtered$sample_name == sps_binned$sample_name)
+sps_merged = combineSpectra(
+  sps_binned, f=denisova_metadata_filtered$sample_name)
+sps_merged$sample_name = separate_sample_replicate(sps_merged$spectrumId)[,1]
+```
+
+```{r}
+denisova_sample_metadata = denisova_metadata_filtered %>%
+  distinct(sample_name, .keep_all = T) %>%
+  select(-spectra_name, -replicate)
+all(denisova_sample_metadata$sample_name == sps_merged$sample_name)
+```
+
+### Filtering peaks and contaminants
+```{r}
+sps_filtered_peaks = filterMzValues(sps_merged, mz=ref_contams$mass, tolerance=0.2, ppm=100, keep=FALSE)
+sps_filtered_peaks = apply_preprocess(sps_filtered_peaks, in_memory = TRUE, write_data = F)
+```
+
+We filter peaks that appear in only 1% of samples of each taxa
+```{r}
+sps_filtered_peaks = filter_peaks(
+  sps_filtered_peaks, minFreq=0.01, labels=denisova_sample_metadata$zooMS_ID,
+  mergeWhitelists = TRUE)
+```
+
+
+
+
+
+### Write peaks into mzML
+```{r}
+## Each spectra in a single file
+
+# Create file names
+# file_paths = path(
+#   project_folder, 'data', 'processed_merged',
+#   paste0(sps_filtered_peaks_nolab$sample_name, '.mzML')
+# )
+# export(sps_filtered_peaks_nolab, backend=MsBackendMzR(), format='mzML',
+#        file=file_paths)
+
+# All in one file
+export(sps_filtered_peaks, backend=MsBackendMzR(), format='mzML',
+       file=path(project_folder, 'data/processed_merged.mzML'))
+
+write_csv(denisova_sample_metadata,
+          path(project_folder, 'data/denisova_sample_metadata.csv'))
+```
+
+### Checkpoint
+```{r, eval=FALSE}
+sps_filtered_peaks = suppressMessages(
+  Spectra(path(project_folder, 'data/processed_merged.mzML'),
+          source = MsBackendMzR(), centroided = FALSE,
+          BPPARAM = SerialParam()))
+
+denisova_sample_metadata = read_csv(
+  path(project_folder, 'data/denisova_sample_metadata.csv')
+)
+
+sps_filtered_peaks$sample_name = separate_sample_replicate(sps_filtered_peaks$spectrumId)[,1]
+
+
+idx = match(sps_filtered_peaks$sample_name, denisova_sample_metadata$sample_name)
+denisova_sample_metadata = denisova_sample_metadata[idx,]
+all(sps_filtered_peaks$sample_name == denisova_sample_metadata$sample_name)
+```
+
+
+### Intensity matrix
+
+```{r}
+normalize_sum = function(x) return(x/sum(x, na.rm = T))
+standardize_int = function(x) return((x-mean(x, na.rm=T))/sd(x, na.rm = T))
+
+scale_mat = function(x) {
+  m = apply(x, 1, mean, na.rm = T)
+  s = apply(x, 1, sd, na.rm = T)
+  return((x - m)/s)
+}
+
+```
+
+
+```{r}
+int_mat = intensity_matrix(sps_filtered_peaks, specvar_to_names = 'sample_name')
+bin_mat = get_bin_matrix(int_mat)
+int_mat[is.na(int_mat)] = 0
+
+all(rownames(int_mat) == denisova_sample_metadata$sample_name)
+denisova_annot = denisova_sample_metadata %>% as.data.frame()
+
+denisova_annot = denisova_annot %>%
+  mutate(layer = factor(layer, levels=sort(unique(layer))),
+         batch = factor(batch, levels=sort(unique(batch)))
+         )
+
+rownames(denisova_annot) = denisova_annot$sample_name
+denisova_annot = denisova_annot %>%
+  select(-sample_name, -Q2E)
+bytaxa_annot = denisova_annot %>% select(-zooMS_ID)
+```
+
+# Clustering
+
+
+
+```{r}
+
+denisova_annot %>%
+  filter(zooMS_ID == 'Bos/Bison', layer %in% subset_layers) %>%
+  group_by(layer, batch) %>% summarise(n())
+```
+
+
+```{r, fig.width=11, fig.height=10}
+
+layers = c('9.2','9.3','11.2','11.3', '11.4', '12', '13', '14', '15', '17.1')
+palette_layer = hue_pal()(length(layers))
+names(palette_layer) = layers
+
+subset_layers = c('12', '13', '14', '15')
+palette_layer = color('light')(length(subset_layers))
+# palette_layer = hue_pal()(length(subset_layers))
+names(palette_layer) = subset_layers
+
+layer_manual = c(
+    '9.2' = 'hotpink',
+    '9.3' = 'hotpink2',
+    '11.2' = 'red',
+    '11.3' = 'red2',
+    '11.4' = 'red4',
+    '12' = 'cyan',
+    '13' = 'green',
+    '14' = 'darkolivegreen1',
+    '15' = 'blue',
+    '17.1' = 'darkorchid'
+)
+
+palette_batch = color("discrete rainbow")(length(batches_bos))
+names(palette_batch) = batches_bos
+
+batches = c(
+  '4', '8', '9', '15', '16', '17', '18', '19', '20'
+)
+
+denisova_colors = list(
+  layer = palette_layer,
+  batch = palette_batch
+)
+
+```
+
+## Hierarchical clust only
+
+```{r}
+do_hclust = function(fm, md, my_colors, y_scale=0.002, title='', k=5) {
+  hc = hclust(
+    dist(fm, 'euclidean'),
+    method='ward.D2'
+  )
+  
+  colors_df = data.frame(
+    'batch'=my_colors$batch[as.character(md$batch)],
+    'layer'=my_colors$layer[as.character(md$layer)]
+  )
+
+  dend = as.dendrogram(hc)
+  labels(dend) = ''
+  filename = paste0(str_replace_all(title, '/', '_'), '_dend.png')
+  png(path(project_folder, 'result_plots', filename),
+    width=800, height=500
+  )
+  dend %>%
+    set("labels_col", value = c("red", "skyblue", "green", "orange", "grey30"), k = k) %>%
+    set("branches_k_color", value = c("red", "skyblue", "green", "orange", "grey30"), k = k) %>%
+    set("nodes_cex", 0.7) %>%
+    # set('labels', block1_md[labels(dend),]$species) %>%
+    # set('labels',NULL) %>%
+    set('branches_lwd', 3) %>%
+    # set('hang_leaves'=-200) %>%
+    plot(axes=FALSE, horiz=F, main=title)
+   
+  # Add the colored bar
+  colored_bars(colors = colors_df, dend = dend, cex.rowLabels=1.5,
+               horiz=F, add=T, y_scale = y_scale)
+  
+  batches = as.character(sort(unique(md$batch)))
+  layers = as.character(sort(levels(md$layer)))
+  
+  legend('topleft', legend=batches, title='Batch',
+         pch = 15, pt.cex = 3, cex = 1.5, bty = 'n',
+         col=my_colors$batch[batches], inset=c(0, 0))
+  
+  legend(340, 120, legend=layers, title='Layer',
+         pch = 15, pt.cex = 3, cex = 1.5, bty = 'n',
+         col=my_colors$layer[layers], inset=c(0.01,0.3))
+  dev.off()
+}
+```
+
+```{r}
+zooms_groups = list(
+  'Ursidae' = NULL,
+  'Bos/Bison' = c(
+    '4' , '8', '9' , '15', '16', '17', '18', '19'),
+  'Cervidae/Gazella/Saiga' = c(
+    '15', '16', '17', '19'
+  )
+)
+# TODO: create color palette for each taxa, according to their batches
+for (z in names(zooms_groups)) {
+  mask = denisova_annot$zooMS_ID == z & denisova_annot$layer %in% subset_layers
+  if (!is.null(zooms_groups[[z]])) {
+    mask = mask & denisova_annot$batch %in% zooms_groups[[z]]
+    palette_batch_taxa = color('discrete rainbow')(length(zooms_groups[[z]]))
+    names(palette_batch_taxa) = zooms_groups[[z]]
+    denisova_colors_taxa = list(
+      layer = palette_layer,
+      batch = palette_batch_taxa
+    )
+  } else {
+    denisova_colors_taxa = denisova_colors
+  }
+  
+  int_mat_taxa = int_mat[mask,]
+  bin_mat_taxa = bin_mat[mask,]
+  denisova_annot_taxa = denisova_annot[mask,]
+
+  keep_masses = colSums(bin_mat_taxa) > max(3, nrow(bin_mat_taxa)*0.05)
+
+  int_mat_taxa = int_mat_taxa[,keep_masses]
+  bin_mat_taxa = bin_mat_taxa[,keep_masses]
+  attr(int_mat_taxa, 'mass') = attr(int_mat_taxa, 'mass')[keep_masses]
+  attr(bin_mat_taxa, 'mass') = attr(bin_mat_taxa, 'mass')[keep_masses]
+
+  # Remove samples with less than 5 masses
+  keep_samples = rowSums(bin_mat_taxa) > 5
+  int_mat_taxa = int_mat_taxa[keep_samples,]
+  bin_mat_taxa = bin_mat_taxa[keep_samples,]
+  denisova_annot_taxa = denisova_annot_taxa[keep_samples,]
+
+  # mm_normalized = int_mat_taxa
+  mm_normalized = t(scale_mat(t(int_mat_taxa)))
+  
+  denisova_annot_taxa$layer = droplevels(denisova_annot_taxa$layer)
+  denisova_annot_taxa$batch = droplevels(denisova_annot_taxa$batch)
+
+  do_hclust(mm_normalized, denisova_annot_taxa, denisova_colors_taxa,
+    y_scale = 20, title = z, k=5)
+
+}
+```
+
+
+
+
+

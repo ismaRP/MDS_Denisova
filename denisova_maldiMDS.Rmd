@@ -1,0 +1,907 @@
+---
+title: "Denisova MALDI Deamidation Score"
+author: "Ismael"
+date: "2024-05-27"
+output:
+  - html_document
+  - github_document
+---
+
+```{r, include=FALSE}
+library(here)
+i_am('README.md')
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load packages
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(broom)
+library(Spectra)
+library(ggpointdensity)
+library(viridis)
+library(tictoc)
+
+
+# library(maldiMDS)
+library(MALDIzooMS)
+
+library(devtools)
+maldiMDS = '/home/ismael/palaeoproteomics/MALDI/maldiMDS'
+load_all(maldiMDS)
+
+
+```
+
+## Load and prepare data
+
+Please download the data from Mendeley repository and transform it to mzML
+https://doi.org/10.17632/bjvt47wb9c.1
+https://doi.org/10.17632/wfsv6bt64w.1
+https://doi.org/10.17632/h79h6t77tj.1
+
+Be aware that the files have a "E_1_FNR_" prefix in the name that needs to be removed to be able
+to match the metadata.
+
+Place the mzML files under the data folder, under a denisova_mzml folder.
+
+
+```{r, echo=FALSE, warning=FALSE}
+mzml_folder = here('data/denisova_mzml')
+mzml_files = list.files(mzml_folder, full.names = F)
+mzml_folder_by_taxa = here('data/by_taxa')
+
+# Read metadata
+denisova_metadata = read_csv(
+  here('data/metadata_denisova.csv')
+)
+
+
+denisova_metadata = denisova_metadata %>%
+  mutate(
+    layer=factor(layer, levels=sort(unique(as.numeric(layer)))),
+    batch=factor(batch, levels=sort(unique(as.numeric(batch)))),
+    GA_q2e=1-Q2E,
+    zooMS_ID = case_match(
+      zooMS_ID,
+      'Bos/Bison' ~ 'Bison/Yak', # making sure we are using the Bison/Yak label
+      .default = zooMS_ID
+    )
+  )
+
+
+denisova_metadata$spectra_name = paste0(
+    denisova_metadata$sample_name, '_', denisova_metadata$replicate)
+ 
+```
+
+
+```{r, echo=FALSE, warning=FALSE}
+
+
+# Taxa groups
+zooms_groups = c(
+  'Bison/Yak',
+  'Cervidae/Gazella/Saiga',
+  'Ovis',
+  'Equidae',
+  'Rhinocerotidae',
+  'Capra',
+  'Canidae',
+  'Crocuta/Panthera',
+  'Ursidae'
+)
+
+
+denisova_metadata = denisova_metadata %>% filter(
+  zooMS_ID %in% zooms_groups
+)
+
+# This removes samples in metadata that don't have a mzML file
+# denisova_metadata = clean_metadata(denisova_metadata, mzml_folder)
+
+
+# If we want to test something just on a selected batch
+batch_test = NULL
+# batch_test = 13
+
+if (!is.null(batch_test)) {
+  denisova_metadata = denisova_metadata %>% filter(
+    batch == batch_test
+  )
+}
+
+# Read peptides, in this case only using the Bos/Bison peptides
+bos_peptides = read_csv(here('data/bison_yak_peptides.csv'))
+# common_peptides = read_csv(file.path(project_folder, 'common_peptides.csv'))
+all_common_peptides = read_csv(here('data/denisova_peptides.csv'))
+```
+Here I will aggregate all the mzML files into single files by taxa such that
+each file includes up to 100 samples (each with 3 replicate spectra) per file.
+Since we have different peptides per taxa, it is sensible to split the data per
+taxa.
+
+```{r}
+max_samples = 300
+split_file_samples = function(z, s) {
+  file_name = gsub('\\/', '_', z[1])
+  s = split(s, s) # split by sample
+  f = ceiling(seq_along(s)/max_samples)
+  ns = mapply(function(f, l) rep(f, l), f, lengths(s), SIMPLIFY = F)
+  ns = do.call(c, ns)
+  file_name = paste0(file_name, '_', ns, '.mzML')
+  return(file_name)
+}
+
+denisova_metadata = denisova_metadata %>% group_by(zooMS_ID) %>%
+  mutate(file_agg = split_file_samples(zooMS_ID, sample_name)) %>%
+  ungroup()
+```
+
+```{r, eval=FALSE}
+lapply(
+  denisova_metadata %>% group_split(file_agg),
+  function(m) {
+    file_name = m$file_agg[1]
+    mzml_files = file.path(mzml_folder, m$file)
+    sps_mzr = suppressMessages(
+      Spectra(mzml_files, source = MsBackendMzR(), centroided = FALSE,
+              BPPARAM=SerialParam(progressbar = TRUE)))
+    processingChunkSize(sps_mzr) = 40
+    sps_mzr$spectrumId = m$spectra_name
+    taxa_path = file.path(mzml_folder_by_taxa, file_name)
+    export(sps_mzr, backend=MsBackendMzR(), file=taxa_path,
+           BPPARAM=SerialParam(progressbar = TRUE))
+  }
+)
+
+```
+
+## Plot preprocess data
+
+
+Plot how the pre and post processed data looks
+
+```{r}
+# Choose randomly some spectra to plot how the preprocessing looks
+# for some peptides
+bos_mzml = mzml_files[grepl('Bos', mzml_files)]
+bos_mzml = file.path(mzml_folder, bos_mzml)
+
+bos_sps = suppressMessages(
+      Spectra(bos_mzml, source = MsBackendMzR(), centroided = FALSE,
+              BPPARAM=SerialParam()))
+plot_spectra = sample(bos_sps$spectrumId, 7)
+bos_sps = bos_sps[which(bos_sps$spectrumId %in% plot_spectra)]
+
+# spectra_names_plot = c(
+#   'DC5536_3', 'DC3910_1', 'DC7710_1', 'DC3946_1', 'DC5370_3', 'DC5448_1', 'DC8494_2')
+# spectra_idx_plot = which(denisova_metadata$spectra_name %in% spectra_names_plot)
+# spectra_idx_plot = c(440, 441, 442, 1099, 1100, 1101)
+peptides_plot = bos_peptides %>% filter(
+  pept_number %in% c('pep4', 'pep5')
+)
+
+```
+
+```{r, fig.width=8, fig.height=10}
+prep_data = preprocess_spectra(
+  sps_mzr = bos_sps,
+  make_plots = TRUE, # Indicate we want the plots
+  peptides_user = peptides_plot,
+  smooth_wma_hws = 8L,
+  smooth_sg_hws = 8L,
+  iterations = 50,
+  halfWindowSize = 10,
+  snr = 2, k = 0L, threshold = 0.33,
+  local_bg = FALSE,
+  mass_range = 100, bg_cutoff = 0.3, l_cutoff = 1e-8,
+  tolerance = 0.3, ppm = 50,
+  n_isopeaks = 8,
+  min_isopeaks = 4,
+  q2e = 0.5,
+  norm_func = max,
+  ncores = 1, chunk_size = 40,
+  verbose = TRUE
+)
+
+plot_preprocessing(prep_data[[1]], prep_data[[2]], peptides_plot, 8, max)
+
+```
+
+## Preprocess data
+
+### Do all the data and peptides, by taxa
+```{r}
+
+prep_by_group = function(metadata_gr, peptides_gr, ncores) {
+  zooMS_ID = peptides_gr$taxon[1]
+  mzml_files = unique(metadata_gr$file_agg)
+  mzml_files = file.path(mzml_folder_by_taxa, mzml_files)
+  
+  cat(sprintf('Processing %s\n', zooMS_ID))
+  peaks = preprocess_spectra(
+    mzml_files = mzml_files,
+    peptides_user = peptides_gr,
+    smooth_wma_hws = 4,
+    smooth_sg_hws = 6,
+    iterations = 50,
+    halfWindowSize = 15,
+    snr = 2, k = 0L, threshold = 0.33,
+    local_bg = FALSE,
+    mass_range = 100, bg_cutoff = 0.5, l_cutoff = 1e-8,
+    tolerance = 0.3, ppm = 50,
+    n_isopeaks = 5,
+    min_isopeaks = 4,
+    norm_func = max,
+    ncores = ncores, chunk_size = 40,
+    verbose = TRUE
+  )
+  cat("Done\n")
+  # peaks = prepare_peaks(
+  #   peaks, peptides_gr, n_isopeaks = 5, int_column = 'intensity_SavitzkyGolay')
+  zooMS_ID = peptides_gr$taxon[1]
+  peaks = peaks %>%
+    mutate(
+      pep_number = factor(pep_number, levels=peptides_gr$pep_number),
+      zooMS_ID = zooMS_ID
+      )
+  
+  return(peaks)
+}
+
+tictoc::tic('Timing MulticoreParam with 6 cores')
+peaks_allsp = mapply(
+  prep_by_group,
+  denisova_metadata %>% group_split(zooMS_ID),
+  all_common_peptides %>% group_split(taxon),
+  MoreArgs = list(ncores=4),
+  SIMPLIFY = FALSE)
+tictoc::toc()
+
+peaks_allsp = do.call(rbind, peaks_allsp)
+
+```
+
+Save peaks for checkpoint
+```{r, eval=FALSE}
+write_csv(peaks_allsp, here('data/peptide_peaks.csv'))
+```
+
+Load checkpoint
+```{r}
+peaks_allsp = read_csv(here('data/peptide_peaks.csv'))
+
+peaks_allsp = peaks_allsp %>% mutate(
+  pep_number = case_match(
+    pep_number,
+    'pep2' ~ 'pep1',
+    'pep3' ~ 'pep2',
+    'pep4' ~ 'pep3',
+    'pep5' ~ 'pep4',
+    'pep7' ~ 'pep5',
+    'pep15' ~ 'pep6',
+    'pep16' ~ 'pep7'
+  ),
+  # Making sure to change Bos/Bison to Bison/Yak
+  zooMS_ID = case_match(
+    zooMS_ID,
+    'Bos/Bison' ~ 'Bison/Yak',
+    .default = zooMS_ID
+  )
+)
+
+pep_order = c(
+  'pep1', 'pep2', 'pep3', 'pep4', 'pep5', 'pep6', 'pep7'
+)
+
+peaks_allsp = peaks_allsp %>%
+  mutate(pep_number = factor(pep_number, levels=pep_order))
+
+```
+
+
+## Diagnostic plots
+
+### Fraction of samples with 0, 4, or 5 peaks for each peptide
+```{r, fig.width=8, fig.height=5}
+plot_n_peaks_per_peptide(peaks_allsp, 5, 4, marker_order = NULL, zooMS_ID)
+
+```
+
+### Fraction of samples with 0, 4 and 5 per layer and taxa
+
+```{r}
+idx = match(peaks_allsp$spectra_name, denisova_metadata$spectra_name)
+
+peaks_allsp$layer = denisova_metadata$layer[idx]
+
+```
+
+
+```{r, fig.width=12, fig.height=8}
+calc_n_frac_peaks = function(x, n_isopeaks, min_isopeaks) {
+  fracs = list()
+  for (n in c(min_isopeaks:n_isopeaks)) {
+    fracs[[paste0('frac_', n)]] = sum(x >= n)/length(x)
+  }
+  return(data.frame(fracs))
+}
+
+min_isopeaks = 4
+n_isopeaks = 4
+a = peaks_allsp %>%
+  group_by(pep_number, zooMS_ID, layer) %>%
+  summarise(calc_n_frac_peaks(n_peaks, n_isopeaks, min_isopeaks)) %>%
+  ungroup() %>%
+  pivot_longer(cols = starts_with('frac'), names_to='n_of_peaks',
+               names_prefix = 'frac_', values_to='fraction') %>%
+  mutate(
+    n_of_peaks = factor(
+      as.integer(n_of_peaks), levels=c(min_isopeaks:n_isopeaks)),
+    pep_number = as.factor(pep_number),
+    zooMS_ID = case_match(
+      zooMS_ID,
+      'Cervidae/Gazella/Saiga' ~ 'Cervidae/\nGazella/Saiga',
+      'Crocuta/Panthera' ~ 'Crocuta/\nPanthera',
+      .default=zooMS_ID
+    ))
+```
+
+
+```{r, fig.width=10, fig.height=8}
+a %>%
+  filter(layer %in% c(11.2, 11.3, 11.4),
+         pep_number %in% c('pep1', 'pep2')) %>%
+  ggplot() +
+    geom_col(aes(x=layer, y=fraction),
+             position='stack') +
+    ylab('Fraction of samples with >4 isotopic peaks') +
+    xlab('peptide') +
+    facet_grid(pep_number ~ zooMS_ID) +
+    scale_x_discrete(guide = guide_axis(n.dodge = 1, angle=45)) +
+    theme_bw() +
+    theme(
+      panel.grid.minor=element_blank(),
+      axis.text.x=element_text(size=9))
+
+```
+
+```{r, fig.width=12, fig.height=8}
+ggplot(a) +
+  geom_col(aes(x=layer, y=fraction, fill=layer, alpha=n_of_peaks),
+           position='stack') +
+  scale_alpha_manual(values=c('4'=0.4, '5'=0.8)) +
+  # scale_fill_grey(
+  #   '# of isotopic\npeaks',
+  #   start=0.8, end=0.3) +
+  ylab('Fraction of samples with X isotopic peaks') +
+  xlab('layer') +
+  facet_grid(zooMS_ID ~ pep_number) +
+  theme_bw() +
+  theme(
+    panel.grid.minor=element_blank(),
+    axis.text.x=element_text(
+      angle=90, vjust = 0.9, hjust= 1, size=9))
+
+```
+
+
+
+### Plot delta mass (or mass error) vs SNR of each peptide peak 
+
+Peptides with high delta mass and low SNR 
+```{r, fig.height=8, fig.width=11}
+
+facet_labeller = function(variable, value) {
+  if (variable=='zooMS_ID') {
+    return(str_replace_all(value, '/', '\n'))
+  } else {
+    return(value)
+  }
+}
+
+ggplot(peaks_allsp) +
+  geom_pointdensity(aes(x=delta_mass, y=SNR, group=pep_number)) +
+  facet_grid(pep_number~zooMS_ID, scales='free_y', labeller=facet_labeller) +
+  scale_color_viridis() +
+  theme_bw()
+```
+
+```{r, fig.height=10, fig.width=10}
+ggplot(peaks_allsp) +
+  geom_pointdensity(
+    aes(x=as.integer(mass_pos), y=delta_mass),
+    position = position_jitter(width = 0.3), adjust=0.2) +
+  facet_grid(pep_number~zooMS_ID, labeller=facet_labeller) +
+  # scale_x_discrete(labels=levels(peaks_allsp$pep_number), limits=c(1,2,3,4,5,6)) +
+  scale_color_viridis() +
+  theme_bw()
+
+```
+
+## Filter peptides
+
+- Remove pep15 for the cases in which it overlaps with keratine contamination.
+  It is very clear from the previous figure.
+- Remove pep4 and 5 for the taxa in which it does not contain Q
+```{r}
+# Will only keep some peptides
+# peaks_filtered = peaks_allsp %>%
+#   filter((pep_number %in% c('pep2','pep3','pep4','pep5')
+#            & zooMS_ID %in% c('Bos/Bison', 'Ovis')) |
+#          (pep_number %in% c('pep2','pep3','pep4','pep5')
+#            & zooMS_ID %in% c('Capra')) |
+#          (pep_number %in% c('pep2','pep3','pep4','pep5')
+#            & zooMS_ID %in% c('Cervidae/Gazella/Saiga', 'Equidae', 'Rhinocerotidae')),
+#          n_peaks > 0)
+
+peaks_filtered = peaks_allsp %>%
+  filter(
+    ((pep_number %in% c('pep1','pep2','pep3','pep4','pep5','pep7') &
+      zooMS_ID %in% c('Bison/Yak', 'Ovis', 'Capra', 'Cervidae/Gazella/Saiga',
+                      'Rhinocerotidae', 'Equidae', 'Canidae')) |
+     (pep_number %in% c('pep1','pep2','pep5','pep6','pep7') &
+      zooMS_ID %in% c('Crocuta/Panthera','Ursidae'))), 
+      n_peaks > 0)
+
+# Filter peptides whose peaks have too high delta mass
+delta_mass_threshold = 0.4
+# peaks_filtered %>% group_by(spectra_name, pep_number) %>%
+#   filter(any(norm_int > 0.8 & abs(delta_mass) < delta_mass_threshold))
+peaks_filtered = peaks_filtered %>% group_by(spectra_name, pep_number) %>%
+  filter(all(abs(delta_mass) < delta_mass_threshold, na.rm=TRUE)) %>% ungroup()
+```
+
+## Calculate q2e 
+
+### Trying different q2e models
+Here I'm just comparing different models to calculate q2e: weighted and non-weighted least squares and with or without intercept term.
+
+(Note it is currently skipped with `eval=FALSE` which will skip evaluating these code chunks when creating the HTML).
+
+```{r, eval=FALSE}
+q2e_models = peaks_filtered %>%
+  group_by(sample, replicate, pep_number) %>%
+  do(wlm_int = wlm_q2e_intercept(data = ., return_model = TRUE),
+     wlm     = wlm_q2e(data=., return_model = TRUE),
+     lm_int  = lm_q2e_intercept(data=., return_model = TRUE),
+     lm      = lm_q2e(data=., return_model = TRUE)) %>%
+  pivot_longer(cols=c(wlm_int, wlm, lm_int, lm), names_to='model', values_to = 'lm_object')
+
+q2e_coeffs = q2e_models %>%
+  mutate(tidied = map(lm_object, tidy)) %>%
+  select(-lm_object) %>%
+  unnest(tidied)
+
+
+calc_q2e = function(term, estimate) {
+  gamma_0 = estimate[term == 'deam_0']
+  gamma_1 = estimate[term == 'deam_1']
+  gamma_2 = estimate[term == 'deam_2']
+  if(is.na(gamma_2)) gamma_2 = 0
+  q2e = 1 - (gamma_0 / (gamma_0 + gamma_1 + gamma_2))
+  return(q2e)
+}
+
+q2e_vals_per_model = q2e_coeffs %>% group_by(sample, replicate, pep_number, model) %>%
+  summarise(q2e=calc_q2e(term, estimate))
+
+q2e_glance = q2e_models %>%
+  mutate(glanced = map(lm_object, glance)) %>%
+  select(-lm_object) %>%
+  unnest(glanced)
+
+q2e_augment = peaks_filtered %>% filter(n_peaks > 0) %>%
+  group_by(sample, replicate, pep_number) %>%
+  mutate(wlm_q2e(norm_int, weight, deam_0, deam_1, deam_2))
+
+ggplot(q2e_glance) +
+  geom_density(aes(x=r.squared, color=model)) +
+  facet_wrap(~pep_number, scales = 'free_y') +
+  xlim(0.8, 1)
+
+ggplot(q2e_glance) +
+  geom_density(aes(x=BIC, color=model)) +
+  facet_wrap(~pep_number, scales = 'free_y')
+```
+
+
+
+```{r, eval=FALSE, fig.width=10, fig.height=10}
+q2e_per_model_wide = q2e_vals_per_model %>% pivot_wider(names_from=model, names_prefix = 'q2e_', values_from = q2e)
+
+q2e_per_model_wide %>% filter_at(vars(starts_with('q2e')), all_vars(. > -2 & . < 3)) %>%
+  ggpairs(aes(color=pep_number), columns = 4:7)
+
+
+ggplot(q2e_vals_per_model) +
+  geom_density(aes(x=q2e, color=model)) +
+  facet_wrap(~pep_number) +
+  xlim(-2,3)
+
+```
+
+
+### Calculate q2e with WLS without intercept
+We go with the Weighted-least squares without intercept, using the `wlm_q2e`
+
+`q2e_vals` contains q2e values for the selected peptides for each sample and replicate-
+```{r}
+q2e_vals = peaks_filtered %>% filter(n_peaks > 0) %>%
+  group_by(zooMS_ID, sample, replicate, pep_number) %>%
+  summarise(wlm_q2e(norm_int, weight, deam_0, deam_1, deam_2)) %>%
+  ungroup() %>%
+  mutate(reliability = 1 - residual)
+```
+
+```{r}
+ggplot(q2e_vals) +
+  geom_density(aes(x=q2e, color=pep_number)) +
+  facet_wrap(~pep_number, ncol=3) +
+  xlim(-1,2) +
+  geom_vline(xintercept = c(0,1), linetype='dashed') +
+  theme_bw()
+
+ggplot(q2e_vals) +
+  geom_pointdensity(aes(x=q2e, y=residual, group=pep_number)) +
+  geom_smooth(aes(x=q2e, y=residual, group=pep_number)) +
+  xlim(-1, 2) +
+  facet_wrap(~pep_number, scales = 'free', ncol=3) +
+  scale_color_viridis() +
+  theme_bw()
+
+ggplot(q2e_vals) +
+  geom_pointdensity(aes(x=q2e, y=gamma_1)) +
+  geom_abline(slope=1, intercept=0, color='#0090ff', linewidth=1.1) +
+  xlim(-1, 2) +
+  facet_wrap(~pep_number, scales = 'free', ncol=3) +
+  scale_color_viridis() +
+  theme_bw()
+
+```
+We can also already calculate a q2e per peptide but already aggregating replicates
+```{r}
+q2e_vals_per_sample = peaks_filtered %>% filter(n_peaks > 0) %>%
+  group_by(zooMS_ID, sample, pep_number) %>% # Here we don't group by replicate so they aggregate
+  summarise(wlm_q2e(norm_int, weight, deam_0, deam_1, deam_2)) %>%
+  ungroup() %>%
+  mutate(reliability = 1 - residual)
+
+```
+
+```{r}
+ggplot(q2e_vals_per_sample) +
+  geom_density(aes(x=q2e, color=pep_number)) +
+  facet_wrap(~pep_number) +
+  xlim(-1,2) +
+  geom_vline(xintercept = c(0,1), linetype='dashed') +
+  theme_bw()
+
+ggplot(q2e_vals_per_sample) +
+  geom_pointdensity(aes(x=q2e, y=residual, group=pep_number)) +
+  geom_smooth(aes(x=q2e, y=residual, group=pep_number)) +
+  xlim(-1, 2) +
+  facet_wrap(~pep_number, scales = 'free') +
+  scale_color_viridis() +
+  theme_bw()
+
+ggplot(q2e_vals_per_sample) +
+  geom_pointdensity(aes(x=q2e, y=gamma_1)) +
+  geom_abline(slope=1, intercept=0, color='#0090ff', linewidth=1.1) +
+  xlim(-1, 2) +
+  facet_wrap(~pep_number, scales = 'free') +
+  scale_color_viridis() +
+  theme_bw()
+```
+
+
+Remove q2e values below 0 and above 1 and with residual above 0.5
+```{r}
+q2e_vals_filtered = q2e_vals %>%
+  filter(q2e > 0, q2e < 1, residual < 0.2)
+
+q2e_vals_per_sample_filtered = q2e_vals_per_sample %>%
+  filter(q2e > 0, q2e < 1, residual < 0.2)
+```
+
+Here we explore the equidae peptide 4 samples, as it has a weird pattern.
+```{r}
+q2e_vals %>%
+  filter(zooMS_ID == 'Equidae', pep_number=='pep4', q2e<0.5)
+  
+```
+Above 0.5
+DC8600_1
+DC9026_1
+DC9196_1
+
+Below 0.5
+DC6058_1
+DC8659_1
+DC8914_1
+
+
+```{r}
+equidae_mzml = mzml_files[grepl('Equidae', mzml_files)]
+equidae_mzml = file.path(mzml_folder, equidae_mzml)
+
+equidae_sps = suppressMessages(
+      Spectra(equidae_mzml, source = MsBackendMzR(), centroided = FALSE,
+              BPPARAM=SerialParam()))
+
+plot_equidae = c(
+  'DC8600_1','DC9026_1','DC9196_1',
+  'DC6058_1','DC8659_1','DC8914_1')
+equidae_sps = equidae_sps[which(equidae_sps$spectrumId %in% plot_equidae)]
+
+plot_peptide = all_common_peptides %>%
+  filter(pept_number %in% c('pep1', 'pep4'), taxon=='Equidae')
+```
+
+```{r, fig.height=10, fig.width=8}
+prep_data = preprocess_spectra(
+  sps_mzr = equidae_sps,
+  make_plots = TRUE, # Indicate we want the plots
+  peptides_user = plot_peptide,
+  smooth_wma_hws = 8L,
+  smooth_sg_hws = 8L,
+  iterations = 50,
+  halfWindowSize = 10,
+  snr = 2, k = 0L, threshold = 0.33,
+  local_bg = FALSE,
+  mass_range = 100, bg_cutoff = 0.3, l_cutoff = 1e-8,
+  tolerance = 0.3, ppm = 50,
+  n_isopeaks = 5,
+  min_isopeaks = 4,
+  q2e = 0.5,
+  norm_func = max,
+  ncores = 1, chunk_size = 6,
+  verbose = TRUE
+)
+
+prep_data[[1]] = prep_data[[1]] %>% mutate(
+  spectra_name = factor(spectra_name, levels = plot_equidae)
+)
+
+prep_data[[2]] = prep_data[[2]] %>% mutate(
+  spectra_name = factor(spectra_name, levels = plot_equidae)
+)
+
+plot_preprocessing(prep_data[[1]], prep_data[[2]], plot_peptide, 8, max)
+```
+
+
+It is clear that pep4 in Equidae has a potential overlapping spurious peptide.
+Samples fir which this happens still pass the residual filtering.
+
+## Calculate MDS
+
+We need to consider that if we calculate the PQI for all the samples together,
+we would be putting in the same model different peptides. In theory, they are equivalent across species, but the differences in sequence might make them behave differently.
+We are also removing some of the peptides for some species.
+We can try both ways:
+
+### All species togetheer
+```{r}
+mds_vals = lme_mds(q2e_vals_filtered, logq = TRUE, g = 'free', return_model = TRUE)
+# Estimates sigma2 has NAs, which then give NAs in predict_sample
+
+```
+
+```{r}
+pept_qqplot(
+  mds_vals$pep, peptides_user = all_common_peptides, label_idx = 1)
+fvsr(
+  mds_vals$pep, peptides_user = all_common_peptides, label_idx = 1)
+```
+
+### Breeak it up by species
+
+```{r}
+
+mds_by_group = function(q2e_vals_gr) {
+  mds_vals_gr = lme_mds(q2e_vals_gr, logq = TRUE, g = 'free', return_model = FALSE)
+  mds_vals_gr = mds_vals_gr$sample
+  return(mds_vals_gr)
+}
+
+mds_vals_by_gr = q2e_vals_filtered %>% group_by(zooMS_ID) %>%
+  do(mds_by_group(q2e_vals_gr = .)) %>% ungroup()
+
+```
+
+
+
+## Cross with metadata and plot
+
+Here we produce some plots straight-away with the data, but check the accompanying
+R script to reproduce the plots in the paper.
+
+Here GA_q2e are the previous previous q2e values, estimated with a genetic algorithm (GA).
+whereas q2e (lower case) are the peptide specific q2e deamidation values calculated using maldiMDS
+We will call them in the plots WLS_q2e for Weighted Least Squares
+
+```{r}
+denisova_sample_metadata = denisova_metadata[!duplicated(denisova_metadata$sample_name),]
+
+
+# Remove zooMS_ID from metadata. That column is already in the PQI data
+# If we don't calculate PQI by species, we leave it in the metadata
+denisova_sample_metadata = denisova_sample_metadata %>% select(-zooMS_ID)
+
+idx = match(mds_vals_by_gr$sample, denisova_sample_metadata$sample_name)
+mds_data = bind_cols(mds_vals_by_gr, denisova_sample_metadata[idx,])
+
+idx = match(q2e_vals_per_sample_filtered$sample, denisova_sample_metadata$sample_name)
+q2e_data = bind_cols(q2e_vals_per_sample_filtered, denisova_sample_metadata[idx,])
+
+idx = match(q2e_vals_per_sample_filtered$sample, mds_vals_by_gr$sample)
+q2e_mds_data = bind_cols(q2e_vals_per_sample_filtered,
+                         mds_vals_by_gr[idx,] %>% select(-sample, -zooMS_ID))
+
+```
+
+
+### Write data
+```{r}
+write_csv(q2e_vals_per_sample, here('data/q2e_per_sample.csv'))
+write_csv(q2e_vals_per_sample_filtered, here('data/q2e_per_sample_filtered.csv'))
+
+write_csv(q2e_mds_data, here('data/q2e_mds_data.csv'))
+write_csv(q2e_data, here('data/q2e_data.csv'))
+write_csv(mds_data, here('data/mds_data.csv'))
+
+
+```
+
+
+
+First we compare the previous GA q2e values with the new ones and the PQI
+```{r}
+ggplot(mds_data) +
+  geom_point(aes(x=GA_q2e, y=MDS.Model, color=zooMS_ID)) +
+  geom_smooth(aes(x=GA_q2e, y=MDS.Model, color=zooMS_ID)) +
+  xlab('GA q2e') + ylab('MALDI Deamidation Score') +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(size=8))
+
+
+ggplot(q2e_data) +
+  geom_point(aes(x=GA_q2e, y=q2e, color=zooMS_ID)) +
+  geom_smooth(aes(x=GA_q2e, y=q2e, color=zooMS_ID)) +
+  ylab('WLS q2e') + xlab('GA q2e') +
+  ylim(0,1) + xlim(0,1) +
+  facet_wrap(~pep_number) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(size=8))
+
+
+ggplot(q2e_mds_data) +
+  geom_point(aes(x=q2e, y=MDS.Model, color=zooMS_ID)) +
+  geom_smooth(aes(x=q2e, y=MDS.Model, color=zooMS_ID)) +
+  xlab('WLS q2e') + ylab('MALDI Deamidation Score') +
+  ylim(0, 1.75) +
+  facet_wrap(~pep_number) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(size=8))
+```
+
+Same plots, but color by peptide, facet by ZooMS ID
+```{r}
+ggplot(q2e_data) +
+  geom_point(aes(x=GA_q2e, y=q2e, color=pep_number)) +
+  ylab('WLS q2e') + xlab('GA q2e') +
+  xlim(0,1) + ylim(0,1) +
+  geom_smooth(aes(x=GA_q2e, y=q2e, color=pep_number)) +
+  facet_wrap(~zooMS_ID) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(size=8))
+
+
+ggplot(q2e_mds_data) +
+  geom_point(aes(x=q2e, y=MDS.Model, color=pep_number)) +
+  xlab('WLS q2e') + ylab('MALDI Deamidation Score') +
+  geom_smooth(aes(x=q2e, y=MDS.Model, color=pep_number)) +
+  xlim(0,1) + ylim(0,2) +
+  facet_wrap(~zooMS_ID) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(size=8))
+```
+
+Now we plot MDS data by layer
+```{r, fig.width=9, fig.height=7}
+
+x_labels = levels(mds_data$layer)
+x_lab_alt = levels(mds_data$layer)
+x_lab_alt[seq(2, 10, 2)] = paste0('\n', x_labels[seq(2, 10, 2)])
+ggplot(mds_data) +
+  geom_jitter(aes(x=layer, y=MDS.Model, fill=layer), shape=21, alpha=0.3) +
+  geom_violin(aes(x=layer, y=MDS.Model, fill=layer, color=layer), scale='width', alpha=0.1) +
+  ylab('MALDI Deamidation Score') +
+  facet_wrap(~zooMS_ID, scales = 'free_y') +
+  scale_x_discrete(limits=levels(mds_data$layer), labels=x_lab_alt, name='layer') +
+  scale_y_continuous(minor_breaks = NULL) +
+  theme_bw() +
+  theme(axis.title.x.bottom = element_text(size=16),
+        axis.text.x.bottom = element_text(size=12),
+        strip.text.x = element_text(size=12))
+
+
+ggplot(mds_data) +
+  geom_jitter(aes(x=zooMS_ID, y=MDS.Model, fill=zooMS_ID), shape=21, alpha=0.3) +
+  geom_violin(aes(x=zooMS_ID, y=MDS.Model, fill=zooMS_ID, color=zooMS_ID), scale='width', alpha=0.1) +
+  ylab('MALDI Deamidation Score') +
+  facet_wrap(~layer, scales = 'free_y') +
+  # scale_x_discrete(limits=levels(mds_data$layer), labels=x_lab_alt, name='layer') +
+  scale_y_continuous(minor_breaks = NULL) +
+  theme_bw() +
+  theme(axis.title.x.bottom = element_blank(),
+        axis.text.x.bottom = element_blank(),
+        strip.text.x = element_text(size=12))
+
+
+ggplot(mds_data) +
+  geom_jitter(aes(x=as.numeric(layer), y=MDS.Model, fill=layer), shape=21, alpha=0.3) +
+  geom_violin(aes(x=as.numeric(layer), y=MDS.Model, fill=layer, color=layer), scale='width', alpha=0.1) +
+  geom_smooth(aes(x=as.numeric(layer), y=MDS.Model)) +
+  scale_x_discrete(limits=levels(mds_data$layer), labels=x_labels, name='layer') +
+  ylab('MALDI Deamidation Score') +
+  theme_bw() +
+  theme(axis.title.x.bottom = element_text(size=16),
+        axis.text.x.bottom = element_text(size=16))
+
+ggplot(mds_data) +
+  geom_jitter(aes(x=layer, y=GA_q2e, fill=layer), shape=21, alpha=0.3) +
+  geom_violin(aes(x=layer, y=GA_q2e, fill=layer, color=layer), scale='width', alpha=0.1) +
+  scale_x_discrete(limits=levels(mds_data$layer), labels=x_lab_alt, name='layer') +
+  scale_y_continuous(minor_breaks = NULL) +
+  ylab('GA q2e') +
+  facet_wrap(~zooMS_ID, scales = 'free_y') +
+  theme_bw() +
+  theme(axis.title.x.bottom = element_text(size=16),
+        axis.text.x.bottom = element_text(size=12),
+        strip.text.x = element_text(size=12))
+
+q2e_data %>% filter(pep_number=='pep2') %>%
+  ggplot() +
+  geom_jitter(aes(x=layer, y=q2e, fill=layer), shape=21, alpha=0.3) +
+  geom_violin(aes(x=layer, y=q2e, fill=layer, color=layer), scale='width', alpha=0.1) +
+  scale_x_discrete(limits=levels(mds_data$layer), labels=x_lab_alt, name='layer') +
+  scale_y_continuous(minor_breaks = NULL) +
+  ylab('COL1a1 508 - WLS q2e') +
+  facet_wrap(~zooMS_ID, scales='free_y') +
+  theme_bw() +
+  theme(axis.title.x.bottom = element_text(size=16),
+        axis.text.x.bottom = element_text(size=12),
+        strip.text.x = element_text(size=12))
+
+```
+
+## Statistical tests on PQI
+
+
+```{r, fig.height=8}
+one_way_model = aov(MDS.Model~layer, data=mds_data)
+one_way_model
+summary(one_way_model)
+
+par(mfrow=c(2,2))
+plot(one_way_model)
+par(mfrow=c(1,1))
+```
+
+```{r, fig.height=15}
+tukey_on_way = TukeyHSD(one_way_model)
+tukey_on_way
+plot(tukey_on_way, las=1)
+```
+
+
+
+
+
+
+
