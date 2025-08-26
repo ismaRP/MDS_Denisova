@@ -162,7 +162,8 @@ lapply(
 ## Plot preprocess data
 
 
-Plot how the pre and post processed data looks
+Plot how the pre and post processed data looks. We are using the Bison/Yak specific
+peptides and samples.
 
 ```{r}
 # Choose randomly some spectra to plot how the preprocessing looks
